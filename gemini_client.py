@@ -21,7 +21,7 @@ HTTP_TIMEOUT = int(os.getenv("GEMINIGEN_HTTP_TIMEOUT", "120"))
 HTTP_MAX_RETRIES = int(os.getenv("GEMINIGEN_HTTP_MAX_RETRIES", "3"))
 HTTP_BACKOFF_BASE = float(os.getenv("GEMINIGEN_HTTP_BACKOFF_BASE", "1.0"))
 
-# Polling settings
+# Polling settings (in case API returns processing first)
 POLL_MAX_SECONDS = int(os.getenv("GEMINIGEN_POLL_MAX_SECONDS", "120"))
 POLL_INTERVAL = float(os.getenv("GEMINIGEN_POLL_INTERVAL", "2.0"))
 
@@ -49,6 +49,7 @@ def _post_with_retry(url: str, headers: dict, data: dict, files: list) -> reques
     last_exc = None
     for attempt in range(1, HTTP_MAX_RETRIES + 1):
         try:
+            # Do NOT set Content-Type manually; requests will build multipart boundary.
             resp = requests.post(url, headers=headers, data=data, files=files, timeout=HTTP_TIMEOUT)
             if 500 <= resp.status_code < 600 and attempt < HTTP_MAX_RETRIES:
                 logging.warning("GeminiGen HTTP %s, retry %s/%s", resp.status_code, attempt, HTTP_MAX_RETRIES)
@@ -64,6 +65,19 @@ def _post_with_retry(url: str, headers: dict, data: dict, files: list) -> reques
             time.sleep(backoff)
             backoff *= 2
     raise GeminiGenAPIError(f"GeminiGen request failed: {last_exc}")
+
+
+def _get_json(url: str, params: Optional[dict] = None) -> Tuple[int, Any]:
+    try:
+        r = requests.get(url, headers=_headers(), params=params, timeout=HTTP_TIMEOUT)
+        if r.status_code >= 400:
+            return r.status_code, r.text
+        try:
+            return r.status_code, r.json()
+        except Exception:
+            return r.status_code, r.text
+    except requests.RequestException as e:
+        return 0, str(e)
 
 
 def _download_image_bytes(url: str) -> bytes:
@@ -89,9 +103,11 @@ def _extract_ids(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]
 def _history_candidates(uuid: Optional[str], req_id: Optional[int]) -> List[Tuple[str, Optional[dict]]]:
     candidates: List[Tuple[str, Optional[dict]]] = []
 
+    # 1) User-provided exact history endpoint template (recommended)
     if GEMINIGEN_HISTORY_URL_TEMPLATE and uuid:
         candidates.append((GEMINIGEN_HISTORY_URL_TEMPLATE.format(uuid=uuid), None))
 
+    # 2) Fallback guesses (safe to try; will be skipped if 404/405)
     if uuid:
         candidates += [
             (f"https://api.geminigen.ai/uapi/v1/history/{uuid}", None),
@@ -108,19 +124,6 @@ def _history_candidates(uuid: Optional[str], req_id: Optional[int]) -> List[Tupl
         ]
 
     return candidates
-
-
-def _get_json(url: str, params: Optional[dict] = None) -> Tuple[int, Any]:
-    try:
-        r = requests.get(url, headers=_headers(), params=params, timeout=HTTP_TIMEOUT)
-        if r.status_code >= 400:
-            return r.status_code, r.text
-        try:
-            return r.status_code, r.json()
-        except Exception:
-            return r.status_code, r.text
-    except requests.RequestException as e:
-        return 0, str(e)
 
 
 def _poll_until_done(initial_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -161,9 +164,24 @@ def _poll_until_done(initial_payload: Dict[str, Any]) -> Dict[str, Any]:
 
         time.sleep(POLL_INTERVAL)
 
-    raise GeminiGenAPIError(
-        f"Still processing after {POLL_MAX_SECONDS}s. Last history response: {last_seen}"
-    )
+    raise GeminiGenAPIError(f"Still processing after {POLL_MAX_SECONDS}s. Last history response: {last_seen}")
+
+
+def _pick_image_url(data: dict) -> Optional[str]:
+    # 1) Sometimes provided directly
+    url = data.get("generate_result")
+    if url:
+        return url
+
+    # 2) Newer format: generated_image list
+    gen = data.get("generated_image") or []
+    if isinstance(gen, list) and gen:
+        first = gen[0] if isinstance(gen[0], dict) else None
+        if first:
+            return first.get("file_download_url") or first.get("image_url") or first.get("thumbnail_url")
+
+    # 3) Fallback thumbnail from root
+    return data.get("thumbnail_url")
 
 
 def _call_geminigen(
@@ -199,17 +217,16 @@ def _call_geminigen(
 
     status = data.get("status")
     status_desc = (data.get("status_desc") or "").lower()
-    img_url = data.get("generate_result")
 
     if status == 3 or status_desc == "failed":
         raise GeminiGenAPIError(f"GeminiGen failed: {data.get('error_message') or 'unknown error'}")
 
     if status == 1 or status_desc == "processing":
         data = _poll_until_done(data)
-        img_url = data.get("generate_result")
 
+    img_url = _pick_image_url(data)
     if not img_url:
-        raise GeminiGenNoImageError(f"No generate_result in response: {data}")
+        raise GeminiGenNoImageError(f"No image url in response: {data}")
 
     return _download_image_bytes(img_url)
 
@@ -233,9 +250,10 @@ def call_gemini_pro(
     image_list: List[bytes],
     user_prompt: str,
     aspect_ratio: Optional[str] = None,
-    resolution: Optional[str] = None,  # kept for compatibility
+    resolution: Optional[str] = None,  # kept for compatibility with existing calls
 ) -> bytes:
     limited = (image_list or [])[:MAX_IMAGES_PRO]
+    # resolution is not used by GeminiGen endpoint; ignore it safely
     return _call_geminigen(
         model=MODEL_PRO,
         image_list=limited,
