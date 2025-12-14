@@ -1,0 +1,7 @@
+aiogram==2.25.1
+python-dotenv
+requests
+psycopg2-binary
+fastapi
+uvicorn
+
